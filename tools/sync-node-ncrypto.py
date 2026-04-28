@@ -7,8 +7,11 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 NODE_REPOSITORY = 'https://github.com/nodejs/node.git'
