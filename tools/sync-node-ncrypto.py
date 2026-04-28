@@ -100,6 +100,14 @@ def check_unmapped_files(commit: str) -> None:
         raise SyncError(f'nodejs/node added unmapped deps/ncrypto source/header files:\n{files}')
 
 
+def mapped_files_different_from_node(commit: str) -> list[str]:
+    return [
+        str(destination)
+        for source, destination in MAPPINGS.items()
+        if destination.read_bytes() != node_file(commit, source)
+    ]
+
+
 def write_temp_file(directory: Path, name: str, data: bytes) -> Path:
     path = directory / name
     path.write_bytes(data)
@@ -176,6 +184,16 @@ def sync(args: argparse.Namespace) -> int:
     target_sha = fetch_ref(args.node_repository, args.node_ref)
 
     check_unmapped_files(target_sha)
+
+    if current_state is None and base_sha == target_sha:
+        differing_files = mapped_files_different_from_node(target_sha)
+        if differing_files:
+            files = '\n'.join(f'- {path}' for path in differing_files)
+            raise SyncError(
+                'refusing to bootstrap sync state from identical base and target Node commits because the mapped '
+                f'standalone files differ from nodejs/node:\n{files}\n'
+                'Pass the previous imported nodejs/node commit as --base-node-ref, not the target commit.'
+            )
 
     conflicts: list[str] = []
     would_change = current_state != target_sha
