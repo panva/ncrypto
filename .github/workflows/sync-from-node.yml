@@ -76,8 +76,8 @@ jobs:
             -v "$PWD":"$PWD":Z \
             -w "$PWD" \
             -u "$(id -u):$(id -g)" \
-            kszonek/clang-format-21 \
-            --style=file --verbose -i \
+            silkeh/clang:21 \
+            clang-format --style=file --verbose -i \
             include/ncrypto.h \
             src/ncrypto.cpp \
             src/engine.cpp
