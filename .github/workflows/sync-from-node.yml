@@ -1,0 +1,110 @@
+name: Sync from nodejs/node
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Source repository (owner/name) to sync deps/ncrypto from
+        required: false
+        default: nodejs/node
+      ref:
+        description: Branch, tag, or SHA in the source repository
+        required: false
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ncrypto
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sparse-checkout deps/ncrypto from ${{ inputs.repository }}@${{ inputs.ref }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          path: _node
+          fetch-depth: 1
+          sparse-checkout: deps/ncrypto
+          sparse-checkout-cone-mode: false
+
+      - name: Capture source commit metadata
+        id: src
+        run: |
+          set -euo pipefail
+          sha="$(git -C _node rev-parse HEAD)"
+          short="$(git -C _node rev-parse --short HEAD)"
+          echo "sha=$sha"     >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+      - name: Verify source files exist
+        run: |
+          set -euo pipefail
+          for f in \
+            _node/deps/ncrypto/ncrypto.h \
+            _node/deps/ncrypto/ncrypto.cc \
+            _node/deps/ncrypto/engine.cc; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing expected source file: $f"
+              exit 1
+            fi
+          done
+
+      - name: Copy synced files
+        run: |
+          set -euo pipefail
+          cp _node/deps/ncrypto/ncrypto.h  include/ncrypto.h
+          cp _node/deps/ncrypto/ncrypto.cc src/ncrypto.cpp
+          cp _node/deps/ncrypto/engine.cc  src/engine.cpp
+
+      - name: Remove temporary checkout
+        run: rm -rf _node
+
+      - name: Format synced files with clang-format
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD":"$PWD":Z \
+            -w "$PWD" \
+            -u "$(id -u):$(id -g)" \
+            kszonek/clang-format-21 \
+            --style=file --verbose -i \
+            include/ncrypto.h \
+            src/ncrypto.cpp \
+            src/engine.cpp
+
+      - name: Create or update pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          branch: chore/sync-from-nodejs-node
+          delete-branch: true
+          commit-message: |
+            chore: sync deps/ncrypto from ${{ inputs.repository }}@${{ steps.src.outputs.short }}
+          title: 'chore: sync deps/ncrypto from ${{ inputs.repository }}@${{ steps.src.outputs.short }}'
+          body: |
+            Automated sync of `deps/ncrypto/` from
+            [`${{ inputs.repository }}@${{ steps.src.outputs.short }}`](https://github.com/${{ inputs.repository }}/commit/${{ steps.src.outputs.sha }}).
+
+            File mapping:
+
+            | source (`${{ inputs.repository }}`) | destination |
+            | --- | --- |
+            | `deps/ncrypto/ncrypto.h`  | `include/ncrypto.h` |
+            | `deps/ncrypto/ncrypto.cc` | `src/ncrypto.cpp`   |
+            | `deps/ncrypto/engine.cc`  | `src/engine.cpp`    |
+
+            Triggered by @${{ github.actor }} via `workflow_dispatch`.
+          labels: sync
+          add-paths: |
+            include/ncrypto.h
+            src/ncrypto.cpp
+            src/engine.cpp
