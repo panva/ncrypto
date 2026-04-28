@@ -7,27 +7,17 @@
 #include <openssl/pkcs12.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
-
-#ifndef NCRYPTO_NO_KDF_H
-#include <openssl/kdf.h>
-#endif
-#ifdef OPENSSL_IS_BORINGSSL
-#include <openssl/hkdf.h>
-#endif
-
-#if OPENSSL_VERSION_NUMBER >= 0x30200000L
-#include <openssl/thread.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <string_view>
-#include <vector>
 #if OPENSSL_VERSION_MAJOR >= 3
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 #include <openssl/provider.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L
+#include <openssl/thread.h>
+#endif
 #endif
 #if OPENSSL_WITH_PQC
 struct PQCMapping {
@@ -228,7 +218,7 @@ void DataPointer::zero() {
   OPENSSL_cleanse(data_, len_);
 }
 
-void DataPointer::free() {
+void DataPointer::reset(void* data, size_t length) {
   if (data_ != nullptr) {
     if (secure_) {
       OPENSSL_secure_clear_free(data_, len_);
@@ -236,10 +226,6 @@ void DataPointer::free() {
       OPENSSL_clear_free(data_, len_);
     }
   }
-}
-
-void DataPointer::reset(void* data, size_t length) {
-  free();
   data_ = data;
   len_ = length;
 }
@@ -262,12 +248,7 @@ DataPointer DataPointer::resize(size_t len) {
   size_t actual_len = std::min(len_, len);
   auto buf = release();
   if (actual_len == len_) return DataPointer(buf.data, actual_len);
-  auto new_data = OPENSSL_realloc(buf.data, actual_len);
-  if (new_data == nullptr) {
-    free();
-    return {};
-  }
-  buf.data = new_data;
+  buf.data = OPENSSL_realloc(buf.data, actual_len);
   buf.len = actual_len;
   return DataPointer(buf);
 }
@@ -361,11 +342,6 @@ BIGNUM* BignumPointer::release() {
 size_t BignumPointer::byteLength() const {
   if (bn_ == nullptr) return 0;
   return BN_num_bytes(bn_.get());
-}
-
-size_t BignumPointer::bitLength() const {
-  if (bn_ == nullptr) return 0;
-  return BN_num_bits(bn_.get());
 }
 
 DataPointer BignumPointer::encode() const {
@@ -477,7 +453,6 @@ int BignumPointer::isPrime(int nchecks,
         // TODO(@jasnell): This could be refactored to allow inlining.
         // Not too important right now tho.
         [](int a, int b, BN_GENCB* ctx) mutable -> int {
-          // BN_GENCB is opaque in OpenSSL 3.x, must use accessor
           PrimeCheckCallback& ptr =
               *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
           return ptr(a, b) ? 1 : 0;
@@ -509,7 +484,6 @@ bool BignumPointer::generate(const PrimeConfig& params,
     BN_GENCB_set(
         cb.get(),
         [](int a, int b, BN_GENCB* ctx) mutable -> int {
-          // BN_GENCB is opaque in OpenSSL 3.x, must use accessor
           PrimeCheckCallback& ptr =
               *static_cast<PrimeCheckCallback*>(BN_GENCB_get_arg(ctx));
           return ptr(a, b) ? 1 : 0;
@@ -701,22 +675,6 @@ Buffer<char> ExportChallenge(const char* input, size_t length) {
   return {};
 }
 
-bool VerifySpkac(const Buffer<const char>& input) {
-  return VerifySpkac(input.data, input.len);
-}
-
-BIOPointer ExportPublicKey(const Buffer<const char>& input) {
-  return ExportPublicKey(input.data, input.len);
-}
-
-DataPointer ExportChallenge(const Buffer<const char>& input) {
-  auto buf = ExportChallenge(input.data, input.len);
-  if (buf.data != nullptr) {
-    return DataPointer(buf.data, buf.len);
-  }
-  return {};
-}
-
 // ============================================================================
 namespace {
 enum class AltNameOption {
@@ -819,11 +777,15 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
     // Note that the preferred name syntax (see RFCs 5280 and 1034) with
     // wildcards is a subset of what we consider "safe", so spec-compliant DNS
     // names will never need to be escaped.
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_EMAIL) {
     ASN1_IA5STRING* name = gen->d.rfc822Name;
     BIO_write(out.get(), "email:", 6);
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_URI) {
     ASN1_IA5STRING* name = gen->d.uniformResourceIdentifier;
     BIO_write(out.get(), "URI:", 4);
@@ -831,7 +793,9 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
     // with a few exceptions, most notably URIs that contains commas (see
     // RFC 2396). In other words, most legitimate URIs will not require
     // escaping.
-    PrintAltName(out, reinterpret_cast<const char*>(name->data), name->length);
+    PrintAltName(out,
+                 reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                 ASN1_STRING_length(name));
   } else if (gen->type == GEN_DIRNAME) {
     // Earlier versions of Node.js used X509_NAME_oneline to print the X509_NAME
     // object. The format was non standard and should be avoided. The use of
@@ -864,17 +828,18 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
   } else if (gen->type == GEN_IPADD) {
     BIO_printf(out.get(), "IP Address:");
     const ASN1_OCTET_STRING* ip = gen->d.ip;
-    const unsigned char* b = ip->data;
-    if (ip->length == 4) {
+    const unsigned char* b = ASN1_STRING_get0_data(ip);
+    int ip_len = ASN1_STRING_length(ip);
+    if (ip_len == 4) {
       BIO_printf(out.get(), "%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
-    } else if (ip->length == 16) {
+    } else if (ip_len == 16) {
       for (unsigned int j = 0; j < 8; j++) {
         uint16_t pair = (b[2 * j] << 8) | b[2 * j + 1];
         BIO_printf(out.get(), (j == 0) ? "%X" : ":%X", pair);
       }
     } else {
 #if OPENSSL_VERSION_MAJOR >= 3
-      BIO_printf(out.get(), "<invalid length=%d>", ip->length);
+      BIO_printf(out.get(), "<invalid length=%d>", ip_len);
 #else
       BIO_printf(out.get(), "<invalid>");
 #endif
@@ -924,15 +889,15 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
       if (unicode) {
         auto name = gen->d.otherName->value->value.utf8string;
         PrintAltName(out,
-                     reinterpret_cast<const char*>(name->data),
-                     name->length,
+                     reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                     ASN1_STRING_length(name),
                      AltNameOption::UTF8,
                      prefix);
       } else {
         auto name = gen->d.otherName->value->value.ia5string;
         PrintAltName(out,
-                     reinterpret_cast<const char*>(name->data),
-                     name->length,
+                     reinterpret_cast<const char*>(ASN1_STRING_get0_data(name)),
+                     ASN1_STRING_length(name),
                      AltNameOption::NONE,
                      prefix);
       }
@@ -953,11 +918,14 @@ bool PrintGeneralName(const BIOPointer& out, const GENERAL_NAME* gen) {
 }
 }  // namespace
 
-bool SafeX509SubjectAltNamePrint(const BIOPointer& out, X509_EXTENSION* ext) {
-  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(ext));
+bool SafeX509SubjectAltNamePrint(const BIOPointer& out,
+                                 const X509_EXTENSION* ext) {
+  // const_cast needed for OpenSSL < 4.0 which lacks const-correctness
+  auto* mext = const_cast<X509_EXTENSION*>(ext);
+  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(mext));
   if (ret != NID_subject_alt_name) return false;
 
-  GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(X509V3_EXT_d2i(ext));
+  GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(X509V3_EXT_d2i(mext));
   if (names == nullptr) return false;
 
   bool ok = true;
@@ -976,12 +944,14 @@ bool SafeX509SubjectAltNamePrint(const BIOPointer& out, X509_EXTENSION* ext) {
   return ok;
 }
 
-bool SafeX509InfoAccessPrint(const BIOPointer& out, X509_EXTENSION* ext) {
-  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(ext));
+bool SafeX509InfoAccessPrint(const BIOPointer& out, const X509_EXTENSION* ext) {
+  // const_cast needed for OpenSSL < 4.0 which lacks const-correctness
+  auto* mext = const_cast<X509_EXTENSION*>(ext);
+  auto ret = OBJ_obj2nid(X509_EXTENSION_get_object(mext));
   if (ret != NID_info_access) return false;
 
   AUTHORITY_INFO_ACCESS* descs =
-      static_cast<AUTHORITY_INFO_ACCESS*>(X509V3_EXT_d2i(ext));
+      static_cast<AUTHORITY_INFO_ACCESS*>(X509V3_EXT_d2i(mext));
   if (descs == nullptr) return false;
 
   bool ok = true;
@@ -1125,7 +1095,7 @@ BIOPointer X509View::getValidFrom() const {
   if (cert_ == nullptr) return {};
   BIOPointer bio(BIO_new(BIO_s_mem()));
   if (!bio) return {};
-  ASN1_TIME_print(bio.get(), X509_get_notBefore(cert_));
+  ASN1_TIME_print(bio.get(), X509_get0_notBefore(cert_));
   return bio;
 }
 
@@ -1134,7 +1104,7 @@ BIOPointer X509View::getValidTo() const {
   if (cert_ == nullptr) return {};
   BIOPointer bio(BIO_new(BIO_s_mem()));
   if (!bio) return {};
-  ASN1_TIME_print(bio.get(), X509_get_notAfter(cert_));
+  ASN1_TIME_print(bio.get(), X509_get0_notAfter(cert_));
   return bio;
 }
 
@@ -1163,7 +1133,6 @@ std::optional<std::string> X509View::getSignatureAlgorithmOID() const {
 
 int64_t X509View::getValidToTime() const {
 #ifdef OPENSSL_IS_BORINGSSL
-#ifndef NCRYPTO_NO_ASN1_TIME
   // Boringssl does not implement ASN1_TIME_to_tm in a public way,
   // and only recently added ASN1_TIME_to_posix. Some boringssl
   // users on older version may still need to patch around this
@@ -1172,11 +1141,6 @@ int64_t X509View::getValidToTime() const {
   ASN1_TIME_to_posix(X509_get0_notAfter(cert_), &tp);
   return tp;
 #else
-  // Older versions of Boringssl do not implement the ASN1_TIME_to_*
-  // version functions. For now, neither shall we.
-  return 0LL;
-#endif  // NCRYPTO_NO_ASN1_TIME
-#else   // OPENSSL_IS_BORINGSSL
   struct tm tp;
   ASN1_TIME_to_tm(X509_get0_notAfter(cert_), &tp);
   return PortableTimeGM(&tp);
@@ -1185,15 +1149,9 @@ int64_t X509View::getValidToTime() const {
 
 int64_t X509View::getValidFromTime() const {
 #ifdef OPENSSL_IS_BORINGSSL
-#ifndef NCRYPTO_NO_ASN1_TIME
   int64_t tp;
   ASN1_TIME_to_posix(X509_get0_notBefore(cert_), &tp);
   return tp;
-#else
-  // Older versions of Boringssl do not implement the ASN1_TIME_to_*
-  // version functions. For now, neither shall we.
-  return 0LL;
-#endif  // NCRYPTO_NO_ASN1_TIME
 #else
   struct tm tp;
   ASN1_TIME_to_tm(X509_get0_notBefore(cert_), &tp);
@@ -1554,6 +1512,15 @@ int BIOPointer::Write(BIOPointer* bio, std::string_view message) {
 // ============================================================================
 // DHPointer
 
+namespace {
+bool EqualNoCase(const std::string_view a, const std::string_view b) {
+  if (a.size() != b.size()) return false;
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char a, char b) {
+    return std::tolower(a) == std::tolower(b);
+  });
+}
+}  // namespace
+
 DHPointer::DHPointer(DH* dh) : dh_(dh) {}
 
 DHPointer::DHPointer(DHPointer&& other) noexcept : dh_(other.release()) {}
@@ -1829,17 +1796,26 @@ bool checkHkdfLength(const Digest& md, size_t length) {
   return true;
 }
 
-bool hkdfInfo(const Digest& md,
-              const Buffer<const unsigned char>& key,
-              const Buffer<const unsigned char>& info,
-              const Buffer<const unsigned char>& salt,
-              size_t length,
-              Buffer<unsigned char>* out) {
+DataPointer hkdf(const Digest& md,
+                 const Buffer<const unsigned char>& key,
+                 const Buffer<const unsigned char>& info,
+                 const Buffer<const unsigned char>& salt,
+                 size_t length) {
   ClearErrorOnReturn clearErrorOnReturn;
 
   if (!checkHkdfLength(md, length) || info.len > INT_MAX ||
       salt.len > INT_MAX) {
-    return false;
+    return {};
+  }
+
+  auto ctx = EVPKeyCtxPointer::NewFromID(EVP_PKEY_HKDF);
+  // OpenSSL < 3.0.0 accepted only a void* as the argument of
+  // EVP_PKEY_CTX_set_hkdf_md.
+  const EVP_MD* md_ptr = md;
+  if (!ctx || !EVP_PKEY_derive_init(ctx.get()) ||
+      !EVP_PKEY_CTX_set_hkdf_md(ctx.get(), md_ptr) ||
+      !EVP_PKEY_CTX_add1_hkdf_info(ctx.get(), info.data, info.len)) {
+    return {};
   }
 
   std::string_view actual_salt;
@@ -1850,33 +1826,11 @@ bool hkdfInfo(const Digest& md,
     actual_salt = {default_salt, static_cast<unsigned>(md.size())};
   }
 
-#ifdef OPENSSL_IS_BORINGSSL
-  if (out == nullptr || out->len != length) return false;
-  return HKDF(out->data,
-              length,
-              md,
-              key.data,
-              key.len,
-              reinterpret_cast<const unsigned char*>(actual_salt.data()),
-              actual_salt.size(),
-              info.data,
-              info.len) == 1;
-#else
-  auto ctx = EVPKeyCtxPointer::NewFromID(EVP_PKEY_HKDF);
-  // OpenSSL < 3.0.0 accepted only a void* as the argument of
-  // EVP_PKEY_CTX_set_hkdf_md.
-  const EVP_MD* md_ptr = md;
-  if (!ctx || !EVP_PKEY_derive_init(ctx.get()) ||
-      !EVP_PKEY_CTX_set_hkdf_md(ctx.get(), md_ptr) ||
-      !EVP_PKEY_CTX_add1_hkdf_info(ctx.get(), info.data, info.len)) {
-    return false;
-  }
-
   // We do not use EVP_PKEY_HKDF_MODE_EXTRACT_AND_EXPAND because and instead
   // implement the extraction step ourselves because EVP_PKEY_derive does not
   // handle zero-length keys, which are required for Web Crypto.
   // TODO(jasnell): Once OpenSSL 1.1.1 support is dropped completely, and once
-  // BoringSSL is confirmed to support it, we can hopefully drop this and use
+  // BoringSSL is confirmed to support it, wen can hopefully drop this and use
   // EVP_KDF directly which does support zero length keys.
   unsigned char pseudorandom_key[EVP_MAX_MD_SIZE];
   unsigned pseudorandom_key_len = sizeof(pseudorandom_key);
@@ -1888,66 +1842,28 @@ bool hkdfInfo(const Digest& md,
            key.len,
            pseudorandom_key,
            &pseudorandom_key_len) == nullptr) {
-    return false;
+    return {};
   }
   if (!EVP_PKEY_CTX_hkdf_mode(ctx.get(), EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) ||
       !EVP_PKEY_CTX_set1_hkdf_key(
           ctx.get(), pseudorandom_key, pseudorandom_key_len)) {
-    return false;
+    return {};
   }
 
-  if (out == nullptr || out->len != length) return false;
-
-  return EVP_PKEY_derive(ctx.get(), out->data, &length) > 0;
-#endif
-}
-
-DataPointer hkdf(const Digest& md,
-                 const Buffer<const unsigned char>& key,
-                 const Buffer<const unsigned char>& info,
-                 const Buffer<const unsigned char>& salt,
-                 size_t length) {
   auto buf = DataPointer::Alloc(length);
   if (!buf) return {};
-  Buffer<unsigned char> out{
-      .data = static_cast<unsigned char*>(buf.get()),
-      .len = length,
-  };
-  if (hkdfInfo(md, key, info, salt, length, &out)) {
-    return buf;
+
+  if (EVP_PKEY_derive(
+          ctx.get(), static_cast<unsigned char*>(buf.get()), &length) <= 0) {
+    return {};
   }
-  return {};
+
+  return buf;
 }
 
 bool checkScryptParams(uint64_t N, uint64_t r, uint64_t p, uint64_t maxmem) {
   return EVP_PBE_scrypt(nullptr, 0, nullptr, 0, N, r, p, maxmem, nullptr, 0) ==
          1;
-}
-
-bool scryptInto(const Buffer<const char>& pass,
-                const Buffer<const unsigned char>& salt,
-                uint64_t N,
-                uint64_t r,
-                uint64_t p,
-                uint64_t maxmem,
-                size_t length,
-                Buffer<unsigned char>* out) {
-  ClearErrorOnReturn clearErrorOnReturn;
-
-  if (pass.len > INT_MAX || salt.len > INT_MAX || out == nullptr) {
-    return false;
-  }
-
-  return EVP_PBE_scrypt(pass.data,
-                        pass.len,
-                        salt.data,
-                        salt.len,
-                        N,
-                        r,
-                        p,
-                        maxmem,
-                        out->data,
-                        length) == 1;
 }
 
 DataPointer scrypt(const Buffer<const char>& pass,
@@ -1978,30 +1894,6 @@ DataPointer scrypt(const Buffer<const char>& pass,
   }
 
   return {};
-}
-
-bool pbkdf2Into(const Digest& md,
-                const Buffer<const char>& pass,
-                const Buffer<const unsigned char>& salt,
-                uint32_t iterations,
-                size_t length,
-                Buffer<unsigned char>* out) {
-  ClearErrorOnReturn clearErrorOnReturn;
-
-  if (pass.len > INT_MAX || salt.len > INT_MAX || length > INT_MAX ||
-      out == nullptr) {
-    return false;
-  }
-
-  const EVP_MD* md_ptr = md;
-  return PKCS5_PBKDF2_HMAC(pass.data,
-                           pass.len,
-                           salt.data,
-                           salt.len,
-                           iterations,
-                           md_ptr,
-                           length,
-                           out->data) == 1;
 }
 
 DataPointer pbkdf2(const Digest& md,
@@ -2198,7 +2090,6 @@ EVPKeyPointer EVPKeyPointer::NewRawSeed(
 #endif
 
 EVPKeyPointer EVPKeyPointer::NewDH(DHPointer&& dh) {
-#ifndef NCRYPTO_NO_EVP_DH
   if (!dh) return {};
   auto key = New();
   if (!key) return {};
@@ -2206,11 +2097,6 @@ EVPKeyPointer EVPKeyPointer::NewDH(DHPointer&& dh) {
     dh.release();
   }
   return key;
-#else
-  // Older versions of openssl/boringssl do not implement the EVP_PKEY_*_DH
-  // APIs
-  return {};
-#endif
 }
 
 EVPKeyPointer EVPKeyPointer::NewRSA(RSAPointer&& rsa) {
@@ -2894,21 +2780,6 @@ EVPKeyPointer::operator Dsa() const {
   return Dsa(dsa);
 }
 
-EVPKeyPointer::operator Ec() const {
-  int type = id();
-  if (type != EVP_PKEY_EC) return {};
-
-  OSSL3_CONST EC_KEY* ec = EVP_PKEY_get0_EC_KEY(get());
-  if (ec == nullptr) return {};
-  return Ec(ec);
-}
-
-EVPKeyPointer EVPKeyPointer::clone() const {
-  if (!pkey_) return {};
-  if (!EVP_PKEY_up_ref(pkey_.get())) return {};
-  return EVPKeyPointer(pkey_.get());
-}
-
 bool EVPKeyPointer::validateDsaParameters() const {
   if (!pkey_) return false;
   /* Validate DSA2 parameters from FIPS 186-4 */
@@ -3191,13 +3062,7 @@ SSLCtxPointer SSLCtxPointer::New(const SSL_METHOD* method) {
 }
 
 bool SSLCtxPointer::setGroups(const char* groups) {
-#ifndef NCRYPTO_NO_SSL_GROUP_LIST
   return SSL_CTX_set1_groups_list(get(), groups) == 1;
-#else
-  // Older versions of openssl/boringssl do not implement the
-  // SSL_CTX_set1_groups_list API
-  return false;
-#endif
 }
 
 bool SSLCtxPointer::setCipherSuites(const char* ciphers) {
@@ -3238,13 +3103,9 @@ const Cipher Cipher::AES_256_GCM = Cipher::FromNid(NID_aes_256_gcm);
 const Cipher Cipher::AES_128_KW = Cipher::FromNid(NID_id_aes128_wrap);
 const Cipher Cipher::AES_192_KW = Cipher::FromNid(NID_id_aes192_wrap);
 const Cipher Cipher::AES_256_KW = Cipher::FromNid(NID_id_aes256_wrap);
-
-#ifndef OPENSSL_IS_BORINGSSL
 const Cipher Cipher::AES_128_OCB = Cipher::FromNid(NID_aes_128_ocb);
 const Cipher Cipher::AES_192_OCB = Cipher::FromNid(NID_aes_192_ocb);
 const Cipher Cipher::AES_256_OCB = Cipher::FromNid(NID_aes_256_ocb);
-#endif
-
 const Cipher Cipher::CHACHA20_POLY1305 = Cipher::FromNid(NID_chacha20_poly1305);
 
 bool Cipher::isGcmMode() const {
@@ -3412,21 +3273,19 @@ bool CipherCtxPointer::setKeyLength(size_t length) {
 bool CipherCtxPointer::setIvLength(size_t length) {
   if (!ctx_) return false;
   return EVP_CIPHER_CTX_ctrl(
-             ctx_.get(), EVP_CTRL_AEAD_SET_IVLEN, length, nullptr) > 0;
+      ctx_.get(), EVP_CTRL_AEAD_SET_IVLEN, length, nullptr);
 }
 
 bool CipherCtxPointer::setAeadTag(const Buffer<const char>& tag) {
   if (!ctx_) return false;
-  return EVP_CIPHER_CTX_ctrl(ctx_.get(),
-                             EVP_CTRL_AEAD_SET_TAG,
-                             tag.len,
-                             const_cast<char*>(tag.data)) > 0;
+  return EVP_CIPHER_CTX_ctrl(
+      ctx_.get(), EVP_CTRL_AEAD_SET_TAG, tag.len, const_cast<char*>(tag.data));
 }
 
 bool CipherCtxPointer::setAeadTagLength(size_t length) {
   if (!ctx_) return false;
   return EVP_CIPHER_CTX_ctrl(
-             ctx_.get(), EVP_CTRL_AEAD_SET_TAG, length, nullptr) > 0;
+      ctx_.get(), EVP_CTRL_AEAD_SET_TAG, length, nullptr);
 }
 
 bool CipherCtxPointer::setPadding(bool padding) {
@@ -3496,7 +3355,7 @@ bool CipherCtxPointer::update(const Buffer<const unsigned char>& in,
 
 bool CipherCtxPointer::getAeadTag(size_t len, unsigned char* out) {
   if (!ctx_) return false;
-  return EVP_CIPHER_CTX_ctrl(ctx_.get(), EVP_CTRL_AEAD_GET_TAG, len, out) > 0;
+  return EVP_CIPHER_CTX_ctrl(ctx_.get(), EVP_CTRL_AEAD_GET_TAG, len, out);
 }
 
 // ============================================================================
@@ -3679,8 +3538,38 @@ bool ECKeyPointer::setPublicKey(const ECPointPointer& pub) {
 bool ECKeyPointer::setPublicKeyRaw(const BignumPointer& x,
                                    const BignumPointer& y) {
   if (!key_) return false;
-  return EC_KEY_set_public_key_affine_coordinates(
-             key_.get(), x.get(), y.get()) == 1;
+  const EC_GROUP* group = EC_KEY_get0_group(key_.get());
+  if (group == nullptr) return false;
+
+  // For curves with cofactor h=1, use EC_POINT_oct2point +
+  // EC_KEY_set_public_key instead of EC_KEY_set_public_key_affine_coordinates.
+  // The latter internally calls EC_KEY_check_key() which performs a scalar
+  // multiplication (n*Q) for order validation — redundant when h=1 since every
+  // on-curve point already has order n. EC_POINT_oct2point validates the point
+  // is on the curve, which is sufficient. For curves with h!=1, fall back to
+  // the full check.
+  auto cofactor = BignumPointer::New();
+  if (!cofactor || !EC_GROUP_get_cofactor(group, cofactor.get(), nullptr) ||
+      !cofactor.isOne()) {
+    return EC_KEY_set_public_key_affine_coordinates(
+               key_.get(), x.get(), y.get()) == 1;
+  }
+
+  // Field element byte length: ceil(degree_bits / 8).
+  size_t field_len = (EC_GROUP_get_degree(group) + 7) / 8;
+  // Build an uncompressed point: 0x04 || x || y, each padded to field_len.
+  size_t uncompressed_len = 1 + 2 * field_len;
+  auto buf = DataPointer::Alloc(uncompressed_len);
+  if (!buf) return false;
+  unsigned char* ptr = static_cast<unsigned char*>(buf.get());
+  ptr[0] = POINT_CONVERSION_UNCOMPRESSED;
+  x.encodePaddedInto(ptr + 1, field_len);
+  y.encodePaddedInto(ptr + 1 + field_len, field_len);
+
+  auto point = ECPointPointer::New(group);
+  if (!point) return false;
+  if (!point.setFromBuffer({ptr, uncompressed_len}, group)) return false;
+  return EC_KEY_set_public_key(key_.get(), point.get()) == 1;
 }
 
 bool ECKeyPointer::setPrivateKey(const BignumPointer& priv) {
@@ -3820,7 +3709,6 @@ bool EVPKeyCtxPointer::setDhParameters(int prime_size, uint32_t generator) {
 
 bool EVPKeyCtxPointer::setDsaParameters(uint32_t bits,
                                         std::optional<int> q_bits) {
-#ifndef NCRYPTO_NO_DSA_KEYGEN
   if (!ctx_) return false;
   if (EVP_PKEY_CTX_set_dsa_paramgen_bits(ctx_.get(), bits) != 1) {
     return false;
@@ -3830,10 +3718,6 @@ bool EVPKeyCtxPointer::setDsaParameters(uint32_t bits,
     return false;
   }
   return true;
-#else
-  // Older versions of openssl/boringssl do not implement the DSA keygen.
-  return false;
-#endif
 }
 
 bool EVPKeyCtxPointer::setEcParameters(int curve, int encoding) {
@@ -4333,14 +4217,7 @@ void Cipher::ForEach(Cipher::CipherNameCallback callback) {
 
 Ec::Ec() : ec_(nullptr) {}
 
-Ec::Ec(OSSL3_CONST EC_KEY* key)
-    : ec_(key), x_(BignumPointer::New()), y_(BignumPointer::New()) {
-  if (ec_ != nullptr) {
-    MarkPopErrorOnReturn mark_pop_error_on_return;
-    EC_POINT_get_affine_coordinates(
-        getGroup(), getPublicKey(), x_.get(), y_.get(), nullptr);
-  }
-}
+Ec::Ec(OSSL3_CONST EC_KEY* key) : ec_(key) {}
 
 const EC_GROUP* Ec::getGroup() const {
   return ECKeyPointer::GetGroup(ec_);
@@ -4348,22 +4225,6 @@ const EC_GROUP* Ec::getGroup() const {
 
 int Ec::getCurve() const {
   return EC_GROUP_get_curve_name(getGroup());
-}
-
-uint32_t Ec::getDegree() const {
-  return EC_GROUP_get_degree(getGroup());
-}
-
-std::string Ec::getCurveName() const {
-  return std::string(OBJ_nid2sn(getCurve()));
-}
-
-const EC_POINT* Ec::getPublicKey() const {
-  return EC_KEY_get0_public_key(ec_);
-}
-
-const BIGNUM* Ec::getPrivateKey() const {
-  return EC_KEY_get0_private_key(ec_);
 }
 
 int Ec::GetCurveIdFromName(const char* name) {
@@ -4502,6 +4363,27 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::signInitWithContext(
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
   EVP_PKEY_CTX* ctx = nullptr;
 
+#ifdef OSSL_SIGNATURE_PARAM_INSTANCE
+  // Ed25519 requires the INSTANCE param to switch into Ed25519ctx mode.
+  // Without it, OpenSSL silently ignores the context string.
+  if (key.id() == EVP_PKEY_ED25519) {
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(
+            OSSL_SIGNATURE_PARAM_INSTANCE, const_cast<char*>("Ed25519ctx"), 0),
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context_string.data),
+            context_string.len),
+        OSSL_PARAM_END};
+
+    if (!EVP_DigestSignInit_ex(
+            ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
+      return std::nullopt;
+    }
+    return ctx;
+  }
+#endif  // OSSL_SIGNATURE_PARAM_INSTANCE
+
   const OSSL_PARAM params[] = {
       OSSL_PARAM_construct_octet_string(
           OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
@@ -4525,6 +4407,27 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInitWithContext(
     const Buffer<const unsigned char>& context_string) {
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
   EVP_PKEY_CTX* ctx = nullptr;
+
+#ifdef OSSL_SIGNATURE_PARAM_INSTANCE
+  // Ed25519 requires the INSTANCE param to switch into Ed25519ctx mode.
+  // Without it, OpenSSL silently ignores the context string.
+  if (key.id() == EVP_PKEY_ED25519) {
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(
+            OSSL_SIGNATURE_PARAM_INSTANCE, const_cast<char*>("Ed25519ctx"), 0),
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context_string.data),
+            context_string.len),
+        OSSL_PARAM_END};
+
+    if (!EVP_DigestVerifyInit_ex(
+            ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
+      return std::nullopt;
+    }
+    return ctx;
+  }
+#endif  // OSSL_SIGNATURE_PARAM_INSTANCE
 
   const OSSL_PARAM params[] = {
       OSSL_PARAM_construct_octet_string(
@@ -4824,12 +4727,12 @@ bool X509Name::Iterator::operator!=(const Iterator& other) const {
 std::pair<std::string, std::string> X509Name::Iterator::operator*() const {
   if (loc_ == name_.total_) return {{}, {}};
 
-  X509_NAME_ENTRY* entry = X509_NAME_get_entry(name_, loc_);
+  const X509_NAME_ENTRY* entry = X509_NAME_get_entry(name_, loc_);
   if (entry == nullptr) [[unlikely]]
     return {{}, {}};
 
-  ASN1_OBJECT* name = X509_NAME_ENTRY_get_object(entry);
-  ASN1_STRING* value = X509_NAME_ENTRY_get_data(entry);
+  const ASN1_OBJECT* name = X509_NAME_ENTRY_get_object(entry);
+  const ASN1_STRING* value = X509_NAME_ENTRY_get_data(entry);
 
   if (name == nullptr || value == nullptr) [[unlikely]] {
     return {{}, {}};
@@ -5023,321 +4926,3 @@ DataPointer KEM::Decapsulate(const EVPKeyPointer& private_key,
 #endif  // OPENSSL_VERSION_MAJOR >= 3
 
 }  // namespace ncrypto
-
-// ===========================================================================
-#ifdef NCRYPTO_BSSL_NEEDS_DH_PRIMES
-// While newer versions of BoringSSL have these primes, older versions do not,
-// in particular older versions that conform to fips. We conditionally add
-// them here only if the NCRYPTO_BSSL_NEEDS_DH_PRIMES define is set. Their
-// implementations are defined here to prevent duplicating the symbols.
-extern "C" int bn_set_words(BIGNUM* bn, const BN_ULONG* words, size_t num);
-
-// Backporting primes that may not be supported in earlier boringssl versions.
-// Intentionally keeping the existing C-style formatting.
-
-#define OPENSSL_ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
-
-#if defined(OPENSSL_64_BIT)
-#define TOBN(hi, lo) ((BN_ULONG)(hi) << 32 | (lo))
-#elif defined(OPENSSL_32_BIT)
-#define TOBN(hi, lo) (lo), (hi)
-#else
-#error "Must define either OPENSSL_32_BIT or OPENSSL_64_BIT"
-#endif
-
-static BIGNUM* get_params(BIGNUM* ret,
-                          const BN_ULONG* words,
-                          size_t num_words) {
-  BIGNUM* alloc = nullptr;
-  if (ret == nullptr) {
-    alloc = BN_new();
-    if (alloc == nullptr) {
-      return nullptr;
-    }
-    ret = alloc;
-  }
-
-  if (!bn_set_words(ret, words, num_words)) {
-    BN_free(alloc);
-    return nullptr;
-  }
-
-  return ret;
-}
-
-BIGNUM* BN_get_rfc3526_prime_2048(BIGNUM* ret) {
-  static const BN_ULONG kWords[] = {
-      TOBN(0xffffffff, 0xffffffff), TOBN(0x15728e5a, 0x8aacaa68),
-      TOBN(0x15d22618, 0x98fa0510), TOBN(0x3995497c, 0xea956ae5),
-      TOBN(0xde2bcbf6, 0x95581718), TOBN(0xb5c55df0, 0x6f4c52c9),
-      TOBN(0x9b2783a2, 0xec07a28f), TOBN(0xe39e772c, 0x180e8603),
-      TOBN(0x32905e46, 0x2e36ce3b), TOBN(0xf1746c08, 0xca18217c),
-      TOBN(0x670c354e, 0x4abc9804), TOBN(0x9ed52907, 0x7096966d),
-      TOBN(0x1c62f356, 0x208552bb), TOBN(0x83655d23, 0xdca3ad96),
-      TOBN(0x69163fa8, 0xfd24cf5f), TOBN(0x98da4836, 0x1c55d39a),
-      TOBN(0xc2007cb8, 0xa163bf05), TOBN(0x49286651, 0xece45b3d),
-      TOBN(0xae9f2411, 0x7c4b1fe6), TOBN(0xee386bfb, 0x5a899fa5),
-      TOBN(0x0bff5cb6, 0xf406b7ed), TOBN(0xf44c42e9, 0xa637ed6b),
-      TOBN(0xe485b576, 0x625e7ec6), TOBN(0x4fe1356d, 0x6d51c245),
-      TOBN(0x302b0a6d, 0xf25f1437), TOBN(0xef9519b3, 0xcd3a431b),
-      TOBN(0x514a0879, 0x8e3404dd), TOBN(0x020bbea6, 0x3b139b22),
-      TOBN(0x29024e08, 0x8a67cc74), TOBN(0xc4c6628b, 0x80dc1cd1),
-      TOBN(0xc90fdaa2, 0x2168c234), TOBN(0xffffffff, 0xffffffff),
-  };
-  return get_params(ret, kWords, OPENSSL_ARRAY_SIZE(kWords));
-}
-
-BIGNUM* BN_get_rfc3526_prime_3072(BIGNUM* ret) {
-  static const BN_ULONG kWords[] = {
-      TOBN(0xffffffff, 0xffffffff), TOBN(0x4b82d120, 0xa93ad2ca),
-      TOBN(0x43db5bfc, 0xe0fd108e), TOBN(0x08e24fa0, 0x74e5ab31),
-      TOBN(0x770988c0, 0xbad946e2), TOBN(0xbbe11757, 0x7a615d6c),
-      TOBN(0x521f2b18, 0x177b200c), TOBN(0xd8760273, 0x3ec86a64),
-      TOBN(0xf12ffa06, 0xd98a0864), TOBN(0xcee3d226, 0x1ad2ee6b),
-      TOBN(0x1e8c94e0, 0x4a25619d), TOBN(0xabf5ae8c, 0xdb0933d7),
-      TOBN(0xb3970f85, 0xa6e1e4c7), TOBN(0x8aea7157, 0x5d060c7d),
-      TOBN(0xecfb8504, 0x58dbef0a), TOBN(0xa85521ab, 0xdf1cba64),
-      TOBN(0xad33170d, 0x04507a33), TOBN(0x15728e5a, 0x8aaac42d),
-      TOBN(0x15d22618, 0x98fa0510), TOBN(0x3995497c, 0xea956ae5),
-      TOBN(0xde2bcbf6, 0x95581718), TOBN(0xb5c55df0, 0x6f4c52c9),
-      TOBN(0x9b2783a2, 0xec07a28f), TOBN(0xe39e772c, 0x180e8603),
-      TOBN(0x32905e46, 0x2e36ce3b), TOBN(0xf1746c08, 0xca18217c),
-      TOBN(0x670c354e, 0x4abc9804), TOBN(0x9ed52907, 0x7096966d),
-      TOBN(0x1c62f356, 0x208552bb), TOBN(0x83655d23, 0xdca3ad96),
-      TOBN(0x69163fa8, 0xfd24cf5f), TOBN(0x98da4836, 0x1c55d39a),
-      TOBN(0xc2007cb8, 0xa163bf05), TOBN(0x49286651, 0xece45b3d),
-      TOBN(0xae9f2411, 0x7c4b1fe6), TOBN(0xee386bfb, 0x5a899fa5),
-      TOBN(0x0bff5cb6, 0xf406b7ed), TOBN(0xf44c42e9, 0xa637ed6b),
-      TOBN(0xe485b576, 0x625e7ec6), TOBN(0x4fe1356d, 0x6d51c245),
-      TOBN(0x302b0a6d, 0xf25f1437), TOBN(0xef9519b3, 0xcd3a431b),
-      TOBN(0x514a0879, 0x8e3404dd), TOBN(0x020bbea6, 0x3b139b22),
-      TOBN(0x29024e08, 0x8a67cc74), TOBN(0xc4c6628b, 0x80dc1cd1),
-      TOBN(0xc90fdaa2, 0x2168c234), TOBN(0xffffffff, 0xffffffff),
-  };
-  return get_params(ret, kWords, OPENSSL_ARRAY_SIZE(kWords));
-}
-
-BIGNUM* BN_get_rfc3526_prime_4096(BIGNUM* ret) {
-  static const BN_ULONG kWords[] = {
-      TOBN(0xffffffff, 0xffffffff), TOBN(0x4df435c9, 0x34063199),
-      TOBN(0x86ffb7dc, 0x90a6c08f), TOBN(0x93b4ea98, 0x8d8fddc1),
-      TOBN(0xd0069127, 0xd5b05aa9), TOBN(0xb81bdd76, 0x2170481c),
-      TOBN(0x1f612970, 0xcee2d7af), TOBN(0x233ba186, 0x515be7ed),
-      TOBN(0x99b2964f, 0xa090c3a2), TOBN(0x287c5947, 0x4e6bc05d),
-      TOBN(0x2e8efc14, 0x1fbecaa6), TOBN(0xdbbbc2db, 0x04de8ef9),
-      TOBN(0x2583e9ca, 0x2ad44ce8), TOBN(0x1a946834, 0xb6150bda),
-      TOBN(0x99c32718, 0x6af4e23c), TOBN(0x88719a10, 0xbdba5b26),
-      TOBN(0x1a723c12, 0xa787e6d7), TOBN(0x4b82d120, 0xa9210801),
-      TOBN(0x43db5bfc, 0xe0fd108e), TOBN(0x08e24fa0, 0x74e5ab31),
-      TOBN(0x770988c0, 0xbad946e2), TOBN(0xbbe11757, 0x7a615d6c),
-      TOBN(0x521f2b18, 0x177b200c), TOBN(0xd8760273, 0x3ec86a64),
-      TOBN(0xf12ffa06, 0xd98a0864), TOBN(0xcee3d226, 0x1ad2ee6b),
-      TOBN(0x1e8c94e0, 0x4a25619d), TOBN(0xabf5ae8c, 0xdb0933d7),
-      TOBN(0xb3970f85, 0xa6e1e4c7), TOBN(0x8aea7157, 0x5d060c7d),
-      TOBN(0xecfb8504, 0x58dbef0a), TOBN(0xa85521ab, 0xdf1cba64),
-      TOBN(0xad33170d, 0x04507a33), TOBN(0x15728e5a, 0x8aaac42d),
-      TOBN(0x15d22618, 0x98fa0510), TOBN(0x3995497c, 0xea956ae5),
-      TOBN(0xde2bcbf6, 0x95581718), TOBN(0xb5c55df0, 0x6f4c52c9),
-      TOBN(0x9b2783a2, 0xec07a28f), TOBN(0xe39e772c, 0x180e8603),
-      TOBN(0x32905e46, 0x2e36ce3b), TOBN(0xf1746c08, 0xca18217c),
-      TOBN(0x670c354e, 0x4abc9804), TOBN(0x9ed52907, 0x7096966d),
-      TOBN(0x1c62f356, 0x208552bb), TOBN(0x83655d23, 0xdca3ad96),
-      TOBN(0x69163fa8, 0xfd24cf5f), TOBN(0x98da4836, 0x1c55d39a),
-      TOBN(0xc2007cb8, 0xa163bf05), TOBN(0x49286651, 0xece45b3d),
-      TOBN(0xae9f2411, 0x7c4b1fe6), TOBN(0xee386bfb, 0x5a899fa5),
-      TOBN(0x0bff5cb6, 0xf406b7ed), TOBN(0xf44c42e9, 0xa637ed6b),
-      TOBN(0xe485b576, 0x625e7ec6), TOBN(0x4fe1356d, 0x6d51c245),
-      TOBN(0x302b0a6d, 0xf25f1437), TOBN(0xef9519b3, 0xcd3a431b),
-      TOBN(0x514a0879, 0x8e3404dd), TOBN(0x020bbea6, 0x3b139b22),
-      TOBN(0x29024e08, 0x8a67cc74), TOBN(0xc4c6628b, 0x80dc1cd1),
-      TOBN(0xc90fdaa2, 0x2168c234), TOBN(0xffffffff, 0xffffffff),
-  };
-  return get_params(ret, kWords, OPENSSL_ARRAY_SIZE(kWords));
-}
-
-BIGNUM* BN_get_rfc3526_prime_6144(BIGNUM* ret) {
-  static const BN_ULONG kWords[] = {
-      TOBN(0xffffffff, 0xffffffff), TOBN(0xe694f91e, 0x6dcc4024),
-      TOBN(0x12bf2d5b, 0x0b7474d6), TOBN(0x043e8f66, 0x3f4860ee),
-      TOBN(0x387fe8d7, 0x6e3c0468), TOBN(0xda56c9ec, 0x2ef29632),
-      TOBN(0xeb19ccb1, 0xa313d55c), TOBN(0xf550aa3d, 0x8a1fbff0),
-      TOBN(0x06a1d58b, 0xb7c5da76), TOBN(0xa79715ee, 0xf29be328),
-      TOBN(0x14cc5ed2, 0x0f8037e0), TOBN(0xcc8f6d7e, 0xbf48e1d8),
-      TOBN(0x4bd407b2, 0x2b4154aa), TOBN(0x0f1d45b7, 0xff585ac5),
-      TOBN(0x23a97a7e, 0x36cc88be), TOBN(0x59e7c97f, 0xbec7e8f3),
-      TOBN(0xb5a84031, 0x900b1c9e), TOBN(0xd55e702f, 0x46980c82),
-      TOBN(0xf482d7ce, 0x6e74fef6), TOBN(0xf032ea15, 0xd1721d03),
-      TOBN(0x5983ca01, 0xc64b92ec), TOBN(0x6fb8f401, 0x378cd2bf),
-      TOBN(0x33205151, 0x2bd7af42), TOBN(0xdb7f1447, 0xe6cc254b),
-      TOBN(0x44ce6cba, 0xced4bb1b), TOBN(0xda3edbeb, 0xcf9b14ed),
-      TOBN(0x179727b0, 0x865a8918), TOBN(0xb06a53ed, 0x9027d831),
-      TOBN(0xe5db382f, 0x413001ae), TOBN(0xf8ff9406, 0xad9e530e),
-      TOBN(0xc9751e76, 0x3dba37bd), TOBN(0xc1d4dcb2, 0x602646de),
-      TOBN(0x36c3fab4, 0xd27c7026), TOBN(0x4df435c9, 0x34028492),
-      TOBN(0x86ffb7dc, 0x90a6c08f), TOBN(0x93b4ea98, 0x8d8fddc1),
-      TOBN(0xd0069127, 0xd5b05aa9), TOBN(0xb81bdd76, 0x2170481c),
-      TOBN(0x1f612970, 0xcee2d7af), TOBN(0x233ba186, 0x515be7ed),
-      TOBN(0x99b2964f, 0xa090c3a2), TOBN(0x287c5947, 0x4e6bc05d),
-      TOBN(0x2e8efc14, 0x1fbecaa6), TOBN(0xdbbbc2db, 0x04de8ef9),
-      TOBN(0x2583e9ca, 0x2ad44ce8), TOBN(0x1a946834, 0xb6150bda),
-      TOBN(0x99c32718, 0x6af4e23c), TOBN(0x88719a10, 0xbdba5b26),
-      TOBN(0x1a723c12, 0xa787e6d7), TOBN(0x4b82d120, 0xa9210801),
-      TOBN(0x43db5bfc, 0xe0fd108e), TOBN(0x08e24fa0, 0x74e5ab31),
-      TOBN(0x770988c0, 0xbad946e2), TOBN(0xbbe11757, 0x7a615d6c),
-      TOBN(0x521f2b18, 0x177b200c), TOBN(0xd8760273, 0x3ec86a64),
-      TOBN(0xf12ffa06, 0xd98a0864), TOBN(0xcee3d226, 0x1ad2ee6b),
-      TOBN(0x1e8c94e0, 0x4a25619d), TOBN(0xabf5ae8c, 0xdb0933d7),
-      TOBN(0xb3970f85, 0xa6e1e4c7), TOBN(0x8aea7157, 0x5d060c7d),
-      TOBN(0xecfb8504, 0x58dbef0a), TOBN(0xa85521ab, 0xdf1cba64),
-      TOBN(0xad33170d, 0x04507a33), TOBN(0x15728e5a, 0x8aaac42d),
-      TOBN(0x15d22618, 0x98fa0510), TOBN(0x3995497c, 0xea956ae5),
-      TOBN(0xde2bcbf6, 0x95581718), TOBN(0xb5c55df0, 0x6f4c52c9),
-      TOBN(0x9b2783a2, 0xec07a28f), TOBN(0xe39e772c, 0x180e8603),
-      TOBN(0x32905e46, 0x2e36ce3b), TOBN(0xf1746c08, 0xca18217c),
-      TOBN(0x670c354e, 0x4abc9804), TOBN(0x9ed52907, 0x7096966d),
-      TOBN(0x1c62f356, 0x208552bb), TOBN(0x83655d23, 0xdca3ad96),
-      TOBN(0x69163fa8, 0xfd24cf5f), TOBN(0x98da4836, 0x1c55d39a),
-      TOBN(0xc2007cb8, 0xa163bf05), TOBN(0x49286651, 0xece45b3d),
-      TOBN(0xae9f2411, 0x7c4b1fe6), TOBN(0xee386bfb, 0x5a899fa5),
-      TOBN(0x0bff5cb6, 0xf406b7ed), TOBN(0xf44c42e9, 0xa637ed6b),
-      TOBN(0xe485b576, 0x625e7ec6), TOBN(0x4fe1356d, 0x6d51c245),
-      TOBN(0x302b0a6d, 0xf25f1437), TOBN(0xef9519b3, 0xcd3a431b),
-      TOBN(0x514a0879, 0x8e3404dd), TOBN(0x020bbea6, 0x3b139b22),
-      TOBN(0x29024e08, 0x8a67cc74), TOBN(0xc4c6628b, 0x80dc1cd1),
-      TOBN(0xc90fdaa2, 0x2168c234), TOBN(0xffffffff, 0xffffffff),
-  };
-  return get_params(ret, kWords, OPENSSL_ARRAY_SIZE(kWords));
-}
-
-BIGNUM* BN_get_rfc3526_prime_8192(BIGNUM* ret) {
-  static const BN_ULONG kWords[] = {
-      TOBN(0xffffffff, 0xffffffff), TOBN(0x60c980dd, 0x98edd3df),
-      TOBN(0xc81f56e8, 0x80b96e71), TOBN(0x9e3050e2, 0x765694df),
-      TOBN(0x9558e447, 0x5677e9aa), TOBN(0xc9190da6, 0xfc026e47),
-      TOBN(0x889a002e, 0xd5ee382b), TOBN(0x4009438b, 0x481c6cd7),
-      TOBN(0x359046f4, 0xeb879f92), TOBN(0xfaf36bc3, 0x1ecfa268),
-      TOBN(0xb1d510bd, 0x7ee74d73), TOBN(0xf9ab4819, 0x5ded7ea1),
-      TOBN(0x64f31cc5, 0x0846851d), TOBN(0x4597e899, 0xa0255dc1),
-      TOBN(0xdf310ee0, 0x74ab6a36), TOBN(0x6d2a13f8, 0x3f44f82d),
-      TOBN(0x062b3cf5, 0xb3a278a6), TOBN(0x79683303, 0xed5bdd3a),
-      TOBN(0xfa9d4b7f, 0xa2c087e8), TOBN(0x4bcbc886, 0x2f8385dd),
-      TOBN(0x3473fc64, 0x6cea306b), TOBN(0x13eb57a8, 0x1a23f0c7),
-      TOBN(0x22222e04, 0xa4037c07), TOBN(0xe3fdb8be, 0xfc848ad9),
-      TOBN(0x238f16cb, 0xe39d652d), TOBN(0x3423b474, 0x2bf1c978),
-      TOBN(0x3aab639c, 0x5ae4f568), TOBN(0x2576f693, 0x6ba42466),
-      TOBN(0x741fa7bf, 0x8afc47ed), TOBN(0x3bc832b6, 0x8d9dd300),
-      TOBN(0xd8bec4d0, 0x73b931ba), TOBN(0x38777cb6, 0xa932df8c),
-      TOBN(0x74a3926f, 0x12fee5e4), TOBN(0xe694f91e, 0x6dbe1159),
-      TOBN(0x12bf2d5b, 0x0b7474d6), TOBN(0x043e8f66, 0x3f4860ee),
-      TOBN(0x387fe8d7, 0x6e3c0468), TOBN(0xda56c9ec, 0x2ef29632),
-      TOBN(0xeb19ccb1, 0xa313d55c), TOBN(0xf550aa3d, 0x8a1fbff0),
-      TOBN(0x06a1d58b, 0xb7c5da76), TOBN(0xa79715ee, 0xf29be328),
-      TOBN(0x14cc5ed2, 0x0f8037e0), TOBN(0xcc8f6d7e, 0xbf48e1d8),
-      TOBN(0x4bd407b2, 0x2b4154aa), TOBN(0x0f1d45b7, 0xff585ac5),
-      TOBN(0x23a97a7e, 0x36cc88be), TOBN(0x59e7c97f, 0xbec7e8f3),
-      TOBN(0xb5a84031, 0x900b1c9e), TOBN(0xd55e702f, 0x46980c82),
-      TOBN(0xf482d7ce, 0x6e74fef6), TOBN(0xf032ea15, 0xd1721d03),
-      TOBN(0x5983ca01, 0xc64b92ec), TOBN(0x6fb8f401, 0x378cd2bf),
-      TOBN(0x33205151, 0x2bd7af42), TOBN(0xdb7f1447, 0xe6cc254b),
-      TOBN(0x44ce6cba, 0xced4bb1b), TOBN(0xda3edbeb, 0xcf9b14ed),
-      TOBN(0x179727b0, 0x865a8918), TOBN(0xb06a53ed, 0x9027d831),
-      TOBN(0xe5db382f, 0x413001ae), TOBN(0xf8ff9406, 0xad9e530e),
-      TOBN(0xc9751e76, 0x3dba37bd), TOBN(0xc1d4dcb2, 0x602646de),
-      TOBN(0x36c3fab4, 0xd27c7026), TOBN(0x4df435c9, 0x34028492),
-      TOBN(0x86ffb7dc, 0x90a6c08f), TOBN(0x93b4ea98, 0x8d8fddc1),
-      TOBN(0xd0069127, 0xd5b05aa9), TOBN(0xb81bdd76, 0x2170481c),
-      TOBN(0x1f612970, 0xcee2d7af), TOBN(0x233ba186, 0x515be7ed),
-      TOBN(0x99b2964f, 0xa090c3a2), TOBN(0x287c5947, 0x4e6bc05d),
-      TOBN(0x2e8efc14, 0x1fbecaa6), TOBN(0xdbbbc2db, 0x04de8ef9),
-      TOBN(0x2583e9ca, 0x2ad44ce8), TOBN(0x1a946834, 0xb6150bda),
-      TOBN(0x99c32718, 0x6af4e23c), TOBN(0x88719a10, 0xbdba5b26),
-      TOBN(0x1a723c12, 0xa787e6d7), TOBN(0x4b82d120, 0xa9210801),
-      TOBN(0x43db5bfc, 0xe0fd108e), TOBN(0x08e24fa0, 0x74e5ab31),
-      TOBN(0x770988c0, 0xbad946e2), TOBN(0xbbe11757, 0x7a615d6c),
-      TOBN(0x521f2b18, 0x177b200c), TOBN(0xd8760273, 0x3ec86a64),
-      TOBN(0xf12ffa06, 0xd98a0864), TOBN(0xcee3d226, 0x1ad2ee6b),
-      TOBN(0x1e8c94e0, 0x4a25619d), TOBN(0xabf5ae8c, 0xdb0933d7),
-      TOBN(0xb3970f85, 0xa6e1e4c7), TOBN(0x8aea7157, 0x5d060c7d),
-      TOBN(0xecfb8504, 0x58dbef0a), TOBN(0xa85521ab, 0xdf1cba64),
-      TOBN(0xad33170d, 0x04507a33), TOBN(0x15728e5a, 0x8aaac42d),
-      TOBN(0x15d22618, 0x98fa0510), TOBN(0x3995497c, 0xea956ae5),
-      TOBN(0xde2bcbf6, 0x95581718), TOBN(0xb5c55df0, 0x6f4c52c9),
-      TOBN(0x9b2783a2, 0xec07a28f), TOBN(0xe39e772c, 0x180e8603),
-      TOBN(0x32905e46, 0x2e36ce3b), TOBN(0xf1746c08, 0xca18217c),
-      TOBN(0x670c354e, 0x4abc9804), TOBN(0x9ed52907, 0x7096966d),
-      TOBN(0x1c62f356, 0x208552bb), TOBN(0x83655d23, 0xdca3ad96),
-      TOBN(0x69163fa8, 0xfd24cf5f), TOBN(0x98da4836, 0x1c55d39a),
-      TOBN(0xc2007cb8, 0xa163bf05), TOBN(0x49286651, 0xece45b3d),
-      TOBN(0xae9f2411, 0x7c4b1fe6), TOBN(0xee386bfb, 0x5a899fa5),
-      TOBN(0x0bff5cb6, 0xf406b7ed), TOBN(0xf44c42e9, 0xa637ed6b),
-      TOBN(0xe485b576, 0x625e7ec6), TOBN(0x4fe1356d, 0x6d51c245),
-      TOBN(0x302b0a6d, 0xf25f1437), TOBN(0xef9519b3, 0xcd3a431b),
-      TOBN(0x514a0879, 0x8e3404dd), TOBN(0x020bbea6, 0x3b139b22),
-      TOBN(0x29024e08, 0x8a67cc74), TOBN(0xc4c6628b, 0x80dc1cd1),
-      TOBN(0xc90fdaa2, 0x2168c234), TOBN(0xffffffff, 0xffffffff),
-  };
-  return get_params(ret, kWords, OPENSSL_ARRAY_SIZE(kWords));
-}
-#endif
-
-// ===========================================================================
-#if NCRYPTO_BSSL_LIBDECREPIT_MISSING
-// While BoringSSL implements EVP_CIPHER_do_all_sorted, it includes this
-// inplementation in a library called "libdecrepit", which might not be included
-// depending on how boringssl was built. In such cases, a copy of the function
-// is provided here:
-
-extern "C" void EVP_CIPHER_do_all_sorted(
-    void (*callback)(const EVP_CIPHER* cipher,
-                     const char* name,
-                     const char* unused,
-                     void* arg),
-    void* arg) {
-  callback(EVP_aes_128_cbc(), "AES-128-CBC", NULL, arg);
-  callback(EVP_aes_192_cbc(), "AES-192-CBC", NULL, arg);
-  callback(EVP_aes_256_cbc(), "AES-256-CBC", NULL, arg);
-  callback(EVP_aes_128_ctr(), "AES-128-CTR", NULL, arg);
-  callback(EVP_aes_192_ctr(), "AES-192-CTR", NULL, arg);
-  callback(EVP_aes_256_ctr(), "AES-256-CTR", NULL, arg);
-  callback(EVP_aes_128_ecb(), "AES-128-ECB", NULL, arg);
-  callback(EVP_aes_192_ecb(), "AES-192-ECB", NULL, arg);
-  callback(EVP_aes_256_ecb(), "AES-256-ECB", NULL, arg);
-  callback(EVP_aes_128_ofb(), "AES-128-OFB", NULL, arg);
-  callback(EVP_aes_192_ofb(), "AES-192-OFB", NULL, arg);
-  callback(EVP_aes_256_ofb(), "AES-256-OFB", NULL, arg);
-  callback(EVP_aes_128_gcm(), "AES-128-GCM", NULL, arg);
-  callback(EVP_aes_192_gcm(), "AES-192-GCM", NULL, arg);
-  callback(EVP_aes_256_gcm(), "AES-256-GCM", NULL, arg);
-  callback(EVP_des_cbc(), "DES-CBC", NULL, arg);
-  callback(EVP_des_ecb(), "DES-ECB", NULL, arg);
-  callback(EVP_des_ede(), "DES-EDE", NULL, arg);
-  callback(EVP_des_ede_cbc(), "DES-EDE-CBC", NULL, arg);
-  callback(EVP_des_ede3_cbc(), "DES-EDE3-CBC", NULL, arg);
-  callback(EVP_rc2_cbc(), "RC2-CBC", NULL, arg);
-  callback(EVP_rc4(), "RC4", NULL, arg);
-
-  // OpenSSL returns everything twice, the second time in lower case.
-  callback(EVP_aes_128_cbc(), "aes-128-cbc", NULL, arg);
-  callback(EVP_aes_192_cbc(), "aes-192-cbc", NULL, arg);
-  callback(EVP_aes_256_cbc(), "aes-256-cbc", NULL, arg);
-  callback(EVP_aes_128_ctr(), "aes-128-ctr", NULL, arg);
-  callback(EVP_aes_192_ctr(), "aes-192-ctr", NULL, arg);
-  callback(EVP_aes_256_ctr(), "aes-256-ctr", NULL, arg);
-  callback(EVP_aes_128_ecb(), "aes-128-ecb", NULL, arg);
-  callback(EVP_aes_192_ecb(), "aes-192-ecb", NULL, arg);
-  callback(EVP_aes_256_ecb(), "aes-256-ecb", NULL, arg);
-  callback(EVP_aes_128_ofb(), "aes-128-ofb", NULL, arg);
-  callback(EVP_aes_192_ofb(), "aes-192-ofb", NULL, arg);
-  callback(EVP_aes_256_ofb(), "aes-256-ofb", NULL, arg);
-  callback(EVP_aes_128_gcm(), "aes-128-gcm", NULL, arg);
-  callback(EVP_aes_192_gcm(), "aes-192-gcm", NULL, arg);
-  callback(EVP_aes_256_gcm(), "aes-256-gcm", NULL, arg);
-  callback(EVP_des_cbc(), "des-cbc", NULL, arg);
-  callback(EVP_des_ecb(), "des-ecb", NULL, arg);
-  callback(EVP_des_ede(), "des-ede", NULL, arg);
-  callback(EVP_des_ede_cbc(), "des-ede-cbc", NULL, arg);
-  callback(EVP_des_ede3_cbc(), "des-ede3-cbc", NULL, arg);
-  callback(EVP_rc2_cbc(), "rc2-cbc", NULL, arg);
-  callback(EVP_rc4(), "rc4", NULL, arg);
-}
-#endif
