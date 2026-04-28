@@ -15,20 +15,11 @@
 #include <openssl/hkdf.h>
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x30200000L
-#include <openssl/thread.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cstring>
-<<<<<<< nodejs/ncrypto:src/ncrypto.cpp
 #include <string_view>
 #include <vector>
-||||||| nodejs/node:deps/ncrypto/ncrypto.cc@84aaed75978e
-=======
-#include <string_view>
->>>>>>> nodejs/node:deps/ncrypto/ncrypto.cc@746624951f48
 #if OPENSSL_VERSION_MAJOR >= 3
 #include <openssl/core_names.h>
 #include <openssl/params.h>
@@ -3258,7 +3249,6 @@ const Cipher Cipher::AES_256_GCM = Cipher::FromNid(NID_aes_256_gcm);
 const Cipher Cipher::AES_128_KW = Cipher::FromNid(NID_id_aes128_wrap);
 const Cipher Cipher::AES_192_KW = Cipher::FromNid(NID_id_aes192_wrap);
 const Cipher Cipher::AES_256_KW = Cipher::FromNid(NID_id_aes256_wrap);
-<<<<<<< nodejs/ncrypto:src/ncrypto.cpp
 
 #ifndef OPENSSL_IS_BORINGSSL
 const Cipher Cipher::AES_128_OCB = Cipher::FromNid(NID_aes_128_ocb);
@@ -3266,12 +3256,6 @@ const Cipher Cipher::AES_192_OCB = Cipher::FromNid(NID_aes_192_ocb);
 const Cipher Cipher::AES_256_OCB = Cipher::FromNid(NID_aes_256_ocb);
 #endif
 
-||||||| nodejs/node:deps/ncrypto/ncrypto.cc@84aaed75978e
-=======
-const Cipher Cipher::AES_128_OCB = Cipher::FromNid(NID_aes_128_ocb);
-const Cipher Cipher::AES_192_OCB = Cipher::FromNid(NID_aes_192_ocb);
-const Cipher Cipher::AES_256_OCB = Cipher::FromNid(NID_aes_256_ocb);
->>>>>>> nodejs/node:deps/ncrypto/ncrypto.cc@746624951f48
 const Cipher Cipher::CHACHA20_POLY1305 = Cipher::FromNid(NID_chacha20_poly1305);
 
 bool Cipher::isGcmMode() const {
@@ -4552,57 +4536,6 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInit(
   return ctx;
 }
 
-<<<<<<< nodejs/ncrypto:src/ncrypto.cpp
-std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::signInitWithContext(
-    const EVPKeyPointer& key,
-    const Digest& digest,
-    const Buffer<const unsigned char>& context_string) {
-#ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
-  EVP_PKEY_CTX* ctx = nullptr;
-
-  const OSSL_PARAM params[] = {
-      OSSL_PARAM_construct_octet_string(
-          OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
-          const_cast<unsigned char*>(context_string.data),
-          context_string.len),
-      OSSL_PARAM_END};
-
-  if (!EVP_DigestSignInit_ex(
-          ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
-    return std::nullopt;
-  }
-  return ctx;
-#else
-  return std::nullopt;
-#endif
-}
-
-std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInitWithContext(
-    const EVPKeyPointer& key,
-    const Digest& digest,
-    const Buffer<const unsigned char>& context_string) {
-#ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
-  EVP_PKEY_CTX* ctx = nullptr;
-
-  const OSSL_PARAM params[] = {
-      OSSL_PARAM_construct_octet_string(
-          OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
-          const_cast<unsigned char*>(context_string.data),
-          context_string.len),
-      OSSL_PARAM_END};
-
-  if (!EVP_DigestVerifyInit_ex(
-          ctx_.get(), &ctx, nullptr, nullptr, nullptr, key.get(), params)) {
-    return std::nullopt;
-  }
-  return ctx;
-#else
-  return std::nullopt;
-#endif
-}
-
-||||||| nodejs/node:deps/ncrypto/ncrypto.cc@84aaed75978e
-=======
 std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::signInitWithContext(
     const EVPKeyPointer& key,
     const Digest& digest,
@@ -4693,7 +4626,6 @@ std::optional<EVP_PKEY_CTX*> EVPMDCtxPointer::verifyInitWithContext(
 #endif
 }
 
->>>>>>> nodejs/node:deps/ncrypto/ncrypto.cc@746624951f48
 DataPointer EVPMDCtxPointer::signOneShot(
     const Buffer<const unsigned char>& buf) const {
   if (!ctx_) return {};
