@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       node_ref:
-        description: nodejs/node ref to sync from
-        required: true
-        default: main
-      base_node_ref:
-        description: Optional previous nodejs/node ref for bootstrap or recovery
+        description: nodejs/node release tag to sync from, or latest-stable
         required: false
-        default: ''
+        default: latest-stable
 
 permissions:
   contents: write
@@ -29,11 +25,9 @@ jobs:
         id: sync
         env:
           NODE_REF: ${{ inputs.node_ref }}
-          BASE_NODE_REF: ${{ inputs.base_node_ref }}
         run: |
           python3 tools/sync-node-ncrypto.py \
-            --node-ref "$NODE_REF" \
-            --base-node-ref "$BASE_NODE_REF"
+            --node-ref "$NODE_REF"
 
       - name: Stop when there are no changes
         if: steps.sync.outputs.has_changes != 'true'
@@ -54,7 +48,7 @@ jobs:
             src/engine.cpp \
             src/ncrypto.cpp
           git commit \
-            -m 'chore: sync ncrypto from nodejs/node' \
+            -m 'chore: sync ncrypto from Node.js ${{ steps.sync.outputs.target_version }}' \
             -m 'Node-Base-Commit: ${{ steps.sync.outputs.base_sha }}' \
             -m 'Node-Target-Commit: ${{ steps.sync.outputs.target_sha }}'
           git push --force-with-lease origin "$branch"
@@ -64,8 +58,10 @@ jobs:
         if: steps.sync.outputs.has_changes == 'true'
         run: |
           {
-            echo 'Syncs `deps/ncrypto` from `nodejs/node` into this repository.'
+            echo 'Syncs `deps/ncrypto` from Node.js `${{ steps.sync.outputs.target_version }}` into this repository.'
             echo
+            echo '- Node.js version: `${{ steps.sync.outputs.target_version }}`'
+            echo '- Target node ref: `${{ steps.sync.outputs.target_ref }}`'
             echo '- Base node commit: `${{ steps.sync.outputs.base_sha }}`'
             echo '- Target node commit: `${{ steps.sync.outputs.target_sha }}`'
             echo '- Conflicts: `${{ steps.sync.outputs.has_conflicts }}`'
@@ -83,7 +79,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           branch='${{ steps.commit.outputs.branch }}'
-          title='chore: sync ncrypto from nodejs/node'
+          title='chore: sync ncrypto from Node.js ${{ steps.sync.outputs.target_version }}'
           existing_url="$(gh pr view "$branch" --json url --jq .url 2>/dev/null || true)"
           if [ -n "$existing_url" ]; then
             gh pr edit "$branch" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
